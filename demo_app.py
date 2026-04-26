@@ -9,10 +9,8 @@ Changes vs original:
   - Heatmap + spectral charts using matplotlib.
   - Export command shown in UI.
   - All modes: sample tiles, folder path, .pt upload.
-
-Usage:
-    python demo_app.py           # local  → http://localhost:7860
-    python demo_app.py --share   # public gradio.live URL
+  - FIXED correction: uses the already‑loaded scene tensor directly
+    instead of calling run.py (which had broken band detection).
 """
 
 import sys, time, warnings, re, glob, os
@@ -410,16 +408,78 @@ def run_inference(sample_choice: str, uploaded_file, folder_path: str):
             status_md, spec_md, bw_md, export_md)
 
 
-# ─── OCL simulation ───────────────────────────────────────────────────────────
+# ─── Correction handler (FIXED: uses scene tensor directly) ───────────────────
 
-def run_ocl_sim(n_tiles: int):
-    from ocl import ShadowModeOCL
-    X, y = build_synthetic_dataset(n_per_class=max(n_tiles//3, 10), augment=False)
-    ocl  = ShadowModeOCL(MODEL, buffer_size=32, swap_threshold=0.02)
-    for tile, lbl in zip(X[:n_tiles], y[:n_tiles]):
-        true = lbl.item() if np.random.random() < 0.07 else None
-        ocl.ingest(tile, true_label=true)
-    return ocl.report()
+def apply_correction(folder_path: str, correct_label: str):
+    """
+    Apply correction directly from the folder path.
+    This bypasses the broken run.py and uses the already-loaded scene tensor.
+    """
+    if not folder_path or not folder_path.strip():
+        return "❌ No folder provided.", None, None, None
+
+    try:
+        # Load the scene using the same robust function
+        scene, is_scene, err = load_tile_from_folder(folder_path.strip())
+        if err or not is_scene:
+            return f"❌ Failed to load scene: {err}", None, None, None
+
+        # Parse label
+        try:
+            true_lbl = int(correct_label.split(":")[0])
+        except:
+            return f"❌ Invalid label: {correct_label}", None, None, None
+
+        # Extract patches from scene
+        patch_size = 64
+        stride = 64
+        veg_threshold = 0.15
+        patches = []
+        C, H, W = scene.shape
+        for y in range(0, H - patch_size + 1, stride):
+            for x in range(0, W - patch_size + 1, stride):
+                p = scene[:, y:y+patch_size, x:x+patch_size]
+                b4, b8 = p[0], p[4]
+                ndvi = ((b8 - b4) / (b8 + b4 + 1e-8)).mean().item()
+                if ndvi >= veg_threshold:
+                    patches.append(p)
+
+        if len(patches) == 0:
+            return f"❌ No vegetated patches found in {folder_path}", None, None, None
+
+        X = torch.stack(patches).to(DEVICE)
+        y = torch.full((len(X),), true_lbl, dtype=torch.long).to(DEVICE)
+
+        # Fine-tune head
+        MODEL.head.train()
+        opt = torch.optim.Adam(MODEL.head.parameters(), lr=1e-4)
+        crit = torch.nn.CrossEntropyLoss()
+
+        print(f"Adapting on {len(X)} patches (label={LABELS[true_lbl]})...")
+        for epoch in range(15):
+            idx = torch.randperm(len(X))
+            total_loss = 0.0
+            for i in range(0, len(X), 32):
+                xb = X[idx[i:i+32]]
+                yb = y[idx[i:i+32]]
+                with torch.no_grad():
+                    feats = MODEL._forward_features(xb)
+                    phys = MODEL._physics_scalars(xb)
+                logits = MODEL.head(feats, phys)
+                loss = crit(logits, yb)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+            if epoch % 5 == 0:
+                print(f"  Epoch {epoch:2d}  loss = {total_loss:.4f}")
+
+        MODEL.head.eval()
+        MODEL.save_head("checkpoints/best_head.pth")
+        return f"✅ Correction applied. Model updated to predict {LABELS[true_lbl]}. Run inference again.", None, None, None
+
+    except Exception as e:
+        return f"❌ Correction failed: {e}", None, None, None
 
 
 # ─── Build UI ─────────────────────────────────────────────────────────────────
@@ -454,6 +514,13 @@ _Physics: plants emit excess IR when stomata close under water stress — visibl
                 )
                 gr.Markdown("**Option 3: Upload .pt tile**")
                 upload = gr.File(label="Upload .pt tile", file_types=[".pt",".npy"])
+                with gr.Row():
+                    correct_dd = gr.Dropdown(
+                        ["0: Stable", "1: Moderate", "2: Critical"],
+                        label="Correction (if model was wrong)",
+                        value=None
+                    )
+                    correct_btn = gr.Button("Apply correction + retrain", variant="secondary")
                 run_btn = gr.Button("🛰️  Run Inference", variant="primary", size="lg")
                 gr.Markdown("""
 **Band order:** B4 B5 B6 B7 B8 B8A B11 B12  
@@ -496,6 +563,12 @@ _Physics: plants emit excess IR when stomata close under water stress — visibl
             inputs=[sample_dd, upload, folder_in],
             outputs=outputs
         )
+        # Correction button now uses the dedicated handler
+        correct_btn.click(
+            fn=apply_correction,
+            inputs=[folder_in, correct_dd],
+            outputs=[status_out, tile_img, prob_plot, heatmap_plot]
+        )
         ocl_btn.click(fn=run_ocl_sim, inputs=[n_sl], outputs=[ocl_out])
         demo.load(
             fn=run_inference,
@@ -504,6 +577,18 @@ _Physics: plants emit excess IR when stomata close under water stress — visibl
         )
 
     return demo
+
+
+# ─── OCL simulation (unchanged) ───────────────────────────────────────────────
+
+def run_ocl_sim(n_tiles: int):
+    from ocl import ShadowModeOCL
+    X, y = build_synthetic_dataset(n_per_class=max(n_tiles//3, 10), augment=False)
+    ocl  = ShadowModeOCL(MODEL, buffer_size=32, swap_threshold=0.02)
+    for tile, lbl in zip(X[:n_tiles], y[:n_tiles]):
+        true = lbl.item() if np.random.random() < 0.07 else None
+        ocl.ingest(tile, true_label=true)
+    return ocl.report()
 
 
 if __name__ == "__main__":
