@@ -12,6 +12,8 @@ build/
 venv/
 env/
 ENV/
+raw/
+processed/
 
 # Gradio cache
 .gradio/
