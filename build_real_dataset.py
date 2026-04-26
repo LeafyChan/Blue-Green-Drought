@@ -41,7 +41,7 @@ SCENES = [
     ('gee_scenes/critical_2024',     2),
     ('gee_scenes/stable_2023',       0),
     ('Telangana_Instant_Data',       1),
-    ('Telangana_Instant_Data_post_monsoon', 1),
+    ('Telangana_Instant_Data_post_monsoon', 0),  # post-monsoon = Stable (high soil moisture)
 ]
 
 
@@ -58,8 +58,16 @@ def load_folder(folder):
     return arrays
 
 
-def extract_patches(arrays, patch_size=64, stride=64):
-    """Auto-label each patch from LSWI — ignores folder label."""
+def extract_patches(arrays, patch_size=64, stride=64, folder_label=None):
+    """
+    Tile scene into patches and auto-label each from spectral indices.
+
+    Uses LSWI as primary signal (physically: leaf water status).
+    folder_label is used as a prior for ambiguous moderate-zone patches
+    so that known Stable scenes (post-monsoon) aren't mislabelled.
+
+    Skips bare-soil/cloud patches (NDVI < 0.08).
+    """
     if 'B4' not in arrays:
         return [], []
     H, W = arrays['B4'].shape
@@ -70,16 +78,32 @@ def extract_patches(arrays, patch_size=64, stride=64):
                 arrays.get(b, np.zeros((H, W)))[y:y+patch_size, x:x+patch_size]
                 for b in BANDS
             ], axis=0)
-            # Auto-label from patch LSWI
-            b8   = patch[4].mean()
-            b11  = patch[6].mean()
-            lswi = (b8 - b11) / (b8 + b11 + 1e-8)
-            if lswi > 0.10:
-                label = 0   # Stable
-            elif lswi > -0.04:
-                label = 1   # Moderate
+
+            b4  = patch[0].mean()
+            b8  = patch[4].mean()
+            b11 = patch[6].mean()
+            b12 = patch[7].mean()
+
+            # Skip bare-soil / cloud patches
+            ndvi = (b8 - b4) / (b8 + b4 + 1e-8)
+            if ndvi < 0.08:
+                continue
+
+            lswi  = (b8  - b11) / (b8  + b11  + 1e-8)
+            swir  = b11 / (b12 + 1e-8)
+
+            # Primary labelling from LSWI + SWIR (physically grounded)
+            if lswi > 0.15:
+                label = 0   # Stable: high leaf water
+            elif lswi < -0.05 or swir > 1.8:
+                label = 2   # Critical: severe water deficit
             else:
-                label = 2   # Critical
+                # Ambiguous moderate zone — use folder_label as prior
+                if folder_label is not None:
+                    label = folder_label
+                else:
+                    label = 1   # Default: Moderate
+
             patches.append(patch)
             labels.append(label)
     return patches, labels
@@ -116,12 +140,13 @@ def main(args):
     all_patches, all_labels = [], []
 
     print("\n── Loading scenes ──────────────────────────────────────")
-    for folder, _ in SCENES:
+    for folder, folder_label in SCENES:
         if not Path(folder).exists():
             print(f"  SKIP (not found): {folder}")
             continue
         arrays  = load_folder(folder)
-        patches, labels = extract_patches(arrays, stride=args.stride)
+        patches, labels = extract_patches(arrays, stride=args.stride,
+                                          folder_label=folder_label)
         if not patches:
             print(f"  SKIP (no B4):    {folder}")
             continue

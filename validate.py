@@ -206,73 +206,150 @@ def five_fold_cv(model, X: torch.Tensor, y: torch.Tensor,
 
 def validate_real_scene(model, pt_path: str, true_label: int,
                          device: str = "cpu") -> dict:
-    """Run model on each 64x64 patch from scene.pt (real Sentinel-2 tiles)."""
+    """
+    Run model on real Sentinel-2 scene from a .pt file.
+
+    Handles two formats:
+      A) dict with key 'X': [8, H, W] full scene  (output of tif_to_pt.py)
+      B) dict with key 'X': [N, 8, 64, 64] patch batch
+      C) raw tensor [8, H, W] or [N, 8, 64, 64]
+
+    Tiles full scenes into 64x64 patches, skips bare-soil/urban patches.
+    Compares GWSat against NDVI threshold on the SAME real patches
+    so the delta is meaningful (not trivially 1.0 from synthetic calibration).
+    """
+    import torch
     data = torch.load(pt_path, map_location="cpu", weights_only=False)
+
     if isinstance(data, dict):
-        X = data.get("X", data.get("tiles"))
+        X = data.get("X", data.get("tiles", data.get("data", None)))
         y_given = data.get("y", None)
     else:
         X = data
         y_given = None
 
     if X is None:
-        print(f"  ⚠️  Could not read X from {pt_path}")
+        print(f"  ⚠️  Could not read X from {pt_path}. Keys: {list(data.keys()) if isinstance(data, dict) else 'n/a'}")
         return {}
 
-    # X shape: [8, H, W] — full scene
-    if X.ndim == 4:
-        X = X[0]   # remove batch dimension if present
+    X = X.float()
 
-    # Tile the scene into 64x64 patches (stride=64, no overlap, filter low NDVI)
     patch_size = 64
     stride = 64
-    min_veg_fraction = 0.20
-    veg_threshold = 0.15
+    veg_threshold = 0.10   # lower threshold — real scenes are drier than synthetic
 
-    C, H, W = X.shape
-    patches = []
-    for y in range(0, H - patch_size + 1, stride):
-        for x in range(0, W - patch_size + 1, stride):
-            p = X[:, y:y+patch_size, x:x+patch_size]
-            # Quick vegetation check
-            b4, b8 = p[0], p[4]
-            ndvi = ((b8 - b4) / (b8 + b4 + 1e-8)).mean().item()
-            if ndvi >= veg_threshold:
-                patches.append(p)
+    # ── Case A: already a batch of patches [N, 8, 64, 64] ──────────────────
+    if X.ndim == 4 and X.shape[2] == patch_size and X.shape[3] == patch_size:
+        X_patches = X
+        print(f"  Loaded {len(X_patches)} pre-tiled patches from {pt_path}")
 
-    if len(patches) == 0:
-        print(f"  ⚠️  No vegetated patches found. Consider lowering veg_threshold.")
+    # ── Case B: batch of 1 full scene [1, 8, H, W] ─────────────────────────
+    elif X.ndim == 4:
+        X = X[0]
+        C, H, W = X.shape
+        print(f"  Full scene [1,{C},{H},{W}] → tiling into {patch_size}x{patch_size} patches")
+        patches = []
+        for y in range(0, H - patch_size + 1, stride):
+            for x in range(0, W - patch_size + 1, stride):
+                p = X[:, y:y+patch_size, x:x+patch_size]
+                ndvi = ((p[4] - p[0]) / (p[4] + p[0] + 1e-8)).mean().item()
+                if ndvi >= veg_threshold:
+                    patches.append(p)
+        X_patches = torch.stack(patches) if patches else torch.zeros(0, 8, 64, 64)
+
+    # ── Case C: full scene [8, H, W] ───────────────────────────────────────
+    elif X.ndim == 3:
+        C, H, W = X.shape
+        print(f"  Full scene [{C},{H},{W}] = {H*10/1000:.1f}×{W*10/1000:.1f} km → tiling")
+        patches = []
+        skipped = 0
+        for y in range(0, H - patch_size + 1, stride):
+            for x in range(0, W - patch_size + 1, stride):
+                p = X[:, y:y+patch_size, x:x+patch_size]
+                ndvi = ((p[4] - p[0]) / (p[4] + p[0] + 1e-8)).mean().item()
+                if ndvi >= veg_threshold:
+                    patches.append(p)
+                else:
+                    skipped += 1
+        print(f"  Patches: {len(patches)} vegetated, {skipped} bare-soil/urban skipped")
+        X_patches = torch.stack(patches) if patches else torch.zeros(0, 8, 64, 64)
+    else:
+        print(f"  ⚠️  Unexpected tensor shape: {X.shape}")
         return {}
 
-    X_patches = torch.stack(patches)   # [N, 8, 64, 64]
+    if len(X_patches) == 0:
+        print(f"  ⚠️  No vegetated patches found. Try lowering veg_threshold.")
+        return {}
 
-    # Run inference on patches
-    preds = run_model_on(model, X_patches, device=device)
+    print(f"  Running GWSat on {len(X_patches)} patches…")
 
-    # Ground truth: use provided true_label for all patches (or use y_given if available)
-    if y_given is not None:
-        y_true = y_given.numpy()
+    # ── GWSat predictions ───────────────────────────────────────────────────
+    gwsat_preds = run_model_on(model, X_patches, device=device)
+
+    # ── NDVI baseline on same real patches (for honest comparison) ──────────
+    ndvi_preds = ndvi_baseline_preds(X_patches)
+
+    # ── Ground truth ────────────────────────────────────────────────────────
+    # If patch-level labels exist in the file, use them
+    # Otherwise assign true_label to all patches (scene-level ground truth)
+    if y_given is not None and len(y_given) == len(X_patches):
+        y_true = y_given.numpy().astype(np.int64)
+        label_source = "per-patch labels from file"
     else:
-        y_true = np.full(len(preds), true_label, dtype=np.int64)
+        y_true = np.full(len(gwsat_preds), true_label, dtype=np.int64)
+        label_source = f"scene-level label ({['Stable','Moderate','Critical'][true_label]})"
 
-    m = compute_metrics(y_true, preds)
+    print(f"  Ground-truth source: {label_source}")
 
-    # Scene-level verdict (majority of patches)
-    unique, counts = np.unique(preds, return_counts=True)
-    scene_cls = int(unique[counts.argmax()])
+    gwsat_m = compute_metrics(y_true, gwsat_preds)
+    ndvi_m  = compute_metrics(y_true, ndvi_preds)
+
+    # ── Scene-level verdict (conservative: escalate if ≥15% Critical) ───────
     label_names = ["Stable", "Moderate", "Critical"]
-    print(f"  Real scene prediction: {label_names[scene_cls]}  "
-          f"(ground truth: {label_names[true_label]})")
-    print(f"  Patch F1={m['f1_macro']:.4f}  Acc={m['accuracy']:.4f}")
-    print(m["classification_report"])
+    counts_arr = np.bincount(gwsat_preds, minlength=3)
+    n_total = len(gwsat_preds)
+    frac_crit = counts_arr[2] / n_total
+    frac_mod  = counts_arr[1] / n_total
+
+    # Use same conservative voting as predict_scene
+    raw_winner = int(np.argmax(counts_arr))
+    if frac_crit >= 0.15 and raw_winner < 2:
+        scene_cls = 2
+    elif frac_mod >= 0.25 and raw_winner == 0:
+        scene_cls = 1
+    else:
+        scene_cls = raw_winner
+
+    print(f"\n  Patch distribution: Stable={counts_arr[0]}  "
+          f"Moderate={counts_arr[1]}  Critical={counts_arr[2]}")
+    print(f"  Scene verdict: {label_names[scene_cls]}  "
+          f"(ground truth: {label_names[true_label]})  "
+          f"{'✅' if scene_cls == true_label else '❌'}")
+    print(f"\n  GWSat  patch F1={gwsat_m['f1_macro']:.4f}  "
+          f"Acc={gwsat_m['accuracy']:.4f}")
+    print(f"  NDVI   patch F1={ndvi_m['f1_macro']:.4f}  "
+          f"Acc={ndvi_m['accuracy']:.4f}")
+    print(f"  Δ F1 (GWSat - NDVI): {gwsat_m['f1_macro'] - ndvi_m['f1_macro']:+.4f}")
+    print(gwsat_m["classification_report"])
 
     return {
-        "scene_prediction": label_names[scene_cls],
-        "ground_truth":     label_names[true_label],
-        "correct":          scene_cls == true_label,
-        "n_patches":        len(X_patches),
-        "patch_metrics":    {k: v for k, v in m.items()
-                             if k != "classification_report"},
+        "scene_prediction":   label_names[scene_cls],
+        "ground_truth":       label_names[true_label],
+        "correct":            scene_cls == true_label,
+        "n_patches":          int(len(X_patches)),
+        "patch_distribution": {
+            "Stable":   int(counts_arr[0]),
+            "Moderate": int(counts_arr[1]),
+            "Critical": int(counts_arr[2]),
+        },
+        "gwsat_patch_metrics": {k: v for k, v in gwsat_m.items()
+                                if k != "classification_report"},
+        "ndvi_patch_metrics":  {k: v for k, v in ndvi_m.items()
+                                if k != "classification_report"},
+        "delta_f1_vs_ndvi":   round(gwsat_m["f1_macro"] - ndvi_m["f1_macro"], 4),
+        # Keep old key for backward compat
+        "patch_metrics": {k: v for k, v in gwsat_m.items()
+                          if k != "classification_report"},
     }
 
 
@@ -394,6 +471,9 @@ def main(args):
         out["cross_validation"] = cv_results
     if real_results:
         out["real_scene"] = real_results
+        # Summary delta for the slide
+        if "delta_f1_vs_ndvi" in real_results:
+            out["real_scene_delta_vs_ndvi"] = real_results["delta_f1_vs_ndvi"]
 
     out_path = Path("validation_results.json")
     with open(out_path, "w") as f:
@@ -413,7 +493,38 @@ def main(args):
     if real_results:
         verdict = "✅ CORRECT" if real_results.get("correct") else "❌ WRONG"
         print(f"  Real scene:      {real_results.get('scene_prediction')}  {verdict}")
+        if "delta_f1_vs_ndvi" in real_results:
+            gf = real_results.get("gwsat_patch_metrics", {}).get("f1_macro", "?")
+            nf = real_results.get("ndvi_patch_metrics",  {}).get("f1_macro", "?")
+            print(f"  Real patch F1:   GWSat={gf}  NDVI={nf}  "
+                  f"Δ={real_results['delta_f1_vs_ndvi']:+.4f}")
     print(f"{'='*62}\n")
+
+    # ── Slide-ready numbers ──────────────────────────────────────────────────
+    print("=" * 62)
+    print("SLIDE-READY NUMBERS (for your 2-min presentation)")
+    print("=" * 62)
+    print(f"  Model:          GWSat v3 (TerraMind + Physics Fusion)")
+    print(f"  Backend:        {model.backend_name}")
+    print()
+    print(f"  ── The numbers slide (1:30–1:50) ──────────────────────────")
+    print(f"  GWSat F1:       {gwsat_m['f1_macro']:.3f}  (synthetic holdout, {len(X_h)} unseen patches)")
+    print(f"  NDVI baseline:  {ndvi_m['f1_macro']:.3f}")
+    print(f"  Δ vs NDVI:      {gwsat_m['f1_macro']-ndvi_m['f1_macro']:+.3f}")
+    if cv_results:
+        print(f"  5-fold CV F1:   {cv_results['cv_f1_mean']:.3f} ± {cv_results['cv_f1_std']:.3f}")
+    if real_results:
+        gf = real_results.get("gwsat_patch_metrics", {}).get("f1_macro")
+        nf = real_results.get("ndvi_patch_metrics",  {}).get("f1_macro")
+        if gf is not None:
+            print(f"  Real scene F1:  GWSat={gf:.3f}  NDVI={nf:.3f}  Δ={gf-nf:+.3f}")
+        print(f"  Real scene:     {real_results.get('scene_prediction')}  {verdict}")
+    print()
+    print(f"  ── Limits + next (1:50–2:00) ──────────────────────────────")
+    print(f"  Validated on synthetic holdout + 1 real Telangana scene")
+    print(f"  Multi-season, multi-district validation: next step")
+    print(f"  GEE scenes for Stable + Critical ground-truth: needed")
+    print("=" * 62)
 
     if model.backend_name == "timm_proxy":
         print("⚠️  These results used DeiT-tiny proxy, NOT TerraMind.")

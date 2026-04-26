@@ -665,6 +665,67 @@ class GWSatModel(nn.Module):
         print(f"✅ Loaded: {path}")
 
 
+    def benchmark(self, n_warmup: int = 10, n_runs: int = 100,
+                  patch_size: int = 64) -> dict:
+        """
+        Measure per-patch inference latency (CPU and CUDA if available).
+        Call this after loading checkpoint to get slide-ready numbers.
+
+        Returns dict with keys: cpu_ms, gpu_ms (None if no GPU), checkpoint_mb
+        """
+        import time
+        dummy = torch.zeros(1, 8, patch_size, patch_size)
+        self.eval()
+
+        # CPU benchmark
+        dummy_cpu = dummy.cpu()
+        model_cpu = self.cpu()
+        for _ in range(n_warmup):
+            with torch.no_grad(): model_cpu(dummy_cpu)
+        t0 = time.perf_counter()
+        for _ in range(n_runs):
+            with torch.no_grad(): model_cpu(dummy_cpu)
+        cpu_ms = (time.perf_counter() - t0) * 1000 / n_runs
+
+        # GPU benchmark if available
+        gpu_ms = None
+        if torch.cuda.is_available():
+            self.to("cuda")
+            dummy_gpu = dummy.to("cuda")
+            for _ in range(n_warmup):
+                with torch.no_grad(): self(dummy_gpu)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(n_runs):
+                with torch.no_grad(): self(dummy_gpu)
+            torch.cuda.synchronize()
+            gpu_ms = (time.perf_counter() - t0) * 1000 / n_runs
+            self.to(self.device)
+
+        ckpt_mb = None
+        import os
+        ckpt_path = "checkpoints/best_head.pth"
+        if os.path.exists(ckpt_path):
+            ckpt_mb = round(os.path.getsize(ckpt_path) / 1e6, 2)
+
+        total_params    = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        result = {
+            "cpu_ms":          round(cpu_ms, 1),
+            "gpu_ms":          round(gpu_ms, 1) if gpu_ms else None,
+            "checkpoint_mb":   ckpt_mb,
+            "total_params":    total_params,
+            "trainable_params": trainable_params,
+            "backend":         self.backend_name,
+        }
+        print(f"  Latency:  CPU={cpu_ms:.1f}ms/patch"
+              + (f"  GPU={gpu_ms:.1f}ms/patch" if gpu_ms else ""))
+        if ckpt_mb:
+            print(f"  Head size: {ckpt_mb} MB  |  Total params: {total_params:,}")
+        return result
+
+
 # ──────────────────────────────────────────────────────────────────
 # Spectral index helper (used by infer / demo)
 # ──────────────────────────────────────────────────────────────────

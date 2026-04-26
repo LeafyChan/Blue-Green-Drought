@@ -1,0 +1,43 @@
+2026-04-26 04:26:13,897 - INFO - HTTP Request: HEAD https://huggingface.co/ibm-esa-geospatial/TerraMind-1.0-tiny/resolve/main/TerraMind_v1_tiny.pt "HTTP/1.1 302 Found"
+2026-04-26 04:26:14,084 - INFO - Loaded weights for RED in position 0 of patch embed
+✅ TerraMind loaded via terratorch BACKBONE_REGISTRY (embed_dim=192)
+  Encoder: TerraMind  (embed_dim=192)
+✅ Loaded: checkpoints/best_head.pth
+✅ Loaded checkpoint: checkpoints/best_head.pth
+
+Loading scene (8 bands)…
+  Scene shape : 8 bands × 1114 × 1115 pixels
+  Coverage    : ~11 × 11 km (at 10m/px)
+  Running tiled inference (64×64 patches, stride=32)…
+
+════════════════════════════════════════════════════════════════
+  GWSat v2 — GROUNDWATER STRESS ALERT  [TILED SCENE]
+════════════════════════════════════════════════════════════════
+  Status     : 🚨  CRITICAL
+  Confidence : 60.6%
+  Latency    : 661.5 ms
+  Patches    : 1186 vegetated / 1225 total  (39 urban/bare-soil skipped)
+  Veg stress : Stable:255  Moderate:212  Critical:719
+
+  SEVERE PRE-DROUGHT SIGNAL DETECTED.
+     IR pressure index elevated — stomatal closure confirmed.
+     Alert NDMA / insurance. Crop failure risk: 2-4 weeks.
+
+  Spectral Indices:
+    NDVI (traditional greenness)  : +0.2120  → stressed
+    Red-Edge Index                : +0.0803  → OK
+    Leaf Water Stress (LSWI)      : -0.0670  → WATER DEFICIT
+    IR Pressure Index             : +0.1687  → elevated
+
+  Class Probabilities:
+    Stable       0.233  ███████
+    Moderate     0.287  █████████
+    Critical     0.480  ███████████████
+
+  Bandwidth: 42.47 MB raw → 64 bytes alert (663,552× reduction)
+════════════════════════════════════════════════════════════════
+
+  🚨 DOWNLINK ALERT PAYLOAD (64 bytes):
+     CLASS=CRITICAL  CONF=0.61  LSWI=-0.067  IRP=0.169
+
+  Heatmap saved: stress_heatmap.png
