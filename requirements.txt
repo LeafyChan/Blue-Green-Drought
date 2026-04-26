@@ -1,53 +1,37 @@
 # GWSat v3 — Requirements
 # Python 3.10+ recommended
-# ────────────────────────────────────────────────────────────────
 
-# ── Core ──────────────────────────────────────────────────────────
+# Core
 torch>=2.1.0
 torchvision>=0.16.0
-numpy>=1.24.0,<2.0.0      # pin <2.0 for rasterio compat
+numpy>=1.24.0
+# TerraMind (IBM foundation model — REQUIRED for hackathon)
+# Primary: official terratorch package (install from GitHub)
+git+https://github.com/IBM/terratorch.git
 
-# ── TerraMind (IBM foundation model — REQUIRED for hackathon) ─────
-# Primary: official terramind package
-terramind>=0.1.0
-
-# Fallback A: HuggingFace transformers (if terramind pkg unavailable)
+# Fallback A: HuggingFace transformers (if terratorch unavailable)
 transformers>=4.35.0
 huggingface_hub>=0.19.0
 
-# Fallback B: timm proxy (DeiT-tiny, same ViT-tiny arch)
+# Fallback B: timm proxy (DeiT-tiny)
 timm>=0.9.0
 
-# ── Data ingestion ────────────────────────────────────────────────
+# Data ingestion
 rasterio>=1.3.0
 pandas>=2.0.0
 Pillow>=10.0.0
 
-# ── Training / evaluation ─────────────────────────────────────────
+# Training / evaluation
 scikit-learn>=1.3.0
 tqdm>=4.65.0
 
-# ── Demo (required for judge scoring) ─────────────────────────────
+# Demo
 gradio>=4.0.0
 matplotlib>=3.7.0
 
-# ── GEE pipeline (optional) ───────────────────────────────────────
+# GEE pipeline (optional)
 earthengine-api>=0.1.380
 
-# ── Export / deployment ───────────────────────────────────────────
+# Export / deployment
 onnx>=1.15.0
-
-# ────────────────────────────────────────────────────────────────
-# Jetson Nano / Orin NX install notes:
-#
-# 1. PyTorch wheel from NVIDIA JetPack 5.x:
-#    pip install https://developer.download.nvidia.com/compute/redist/jp/v511/pytorch/torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl
-#
-# 2. TerraMind on ARM (may need source build):
-#    pip install git+https://github.com/IBM/terramind.git
-#
-# 3. TensorRT engine export (3-5× speedup on Jetson GPU):
-#    python export_onnx.py
-#    trtexec --onnx=checkpoints/gwsat.onnx \
-#            --saveEngine=checkpoints/gwsat.engine --int8
-# ────────────────────────────────────────────────────────────────
+onnxruntime>=1.15.0
